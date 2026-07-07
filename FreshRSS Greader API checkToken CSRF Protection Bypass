@@ -1,0 +1,78 @@
+FreshRSS Greader API checkToken CSRF Protection Bypass
+Summary
+The FreshRSS Greader API contains a CSRF token validation bypass vulnerability in the checkToken function. The function accepts an empty string or 'x' as valid CSRF tokens for any non-internal user, allowing an attacker with valid API credentials to perform write operations without providing a legitimate CSRF token.
+Details
+The vulnerability exists in the checkToken function at p/api/greader.php:247-263. This function is called as an anti-CSRF measure for several write operations in the Greader API.
+Root Cause:
+The checkToken function's validation logic at lines 253-256 has a fatal flaw: for any user that is NOT the internal '_' user (Minz_User::INTERNAL_USER), the function immediately returns true if the provided token ($token) is an empty string ('') or the single character 'x'. This means no actual token verification is performed.
+Code Path:
+1. Entry point: HTTP POST requests to Greader API endpoints such as /reader/api/0/edit-tag, /reader/api/0/rename-tag, /reader/api/0/disable-tag, /reader/api/0/mark-all-as-read
+2. Authentication: The request must first pass authentication via authorizationToUser() (line 1118-1120) which validates the Authorization header
+3. The T parameter (token) is extracted from $_POST['T'] and passed to checkToken()
+4. checkToken() bypasses validation for empty or 'x' tokens
+5. After checkToken returns true, the requested write operation is executed
+Trust Boundary Failure:
+The function is meant to enforce a trust boundary between a user's session and the API operations by requiring a unique per-session token obtained from /reader/api/0/token. By accepting empty tokens and 'x', this boundary is removed for all non-internal users.
+Core vulnerable code path:
+// p/api/greader.php:247-263
+private static function checkToken(?FreshRSS_UserConfiguration $conf, string $token): bool {
+    $user = Minz_User::name();
+    if ($user === null || $conf === null || !FreshRSS_Context::hasSystemConf()) {
+        self::unauthorized();
+    }
+    if ($user !== Minz_User::INTERNAL_USER && (
+        $token === '' ||
+        $token === 'x')) {
+        return true;
+    }
+    if (hash_equals(str_pad(sha1(FreshRSS_Context::systemConf()->salt . $user . $conf->apiPasswordHash), 57, 'Z'), $token)) {
+        return true;
+    }
+    Minz_Log::warning('Invalid POST token: ' . $token, API_LOG);
+    self::unauthorized();
+}
+This is the core validation function. Lines 253-256 introduce a critical bypass: for any user that is not the internal '_' user, if the token parameter is an empty string or 'x', the function returns true immediately without performing any real token validation. The 'TODO: Check security consequences' comment explicitly acknowledges the risk.
+// p/api/greader.php:1293-1321
+case 'edit-tag':
+    $token = is_string($_POST['T'] ?? null) ? trim($_POST['T']) : '';
+    self::checkToken(FreshRSS_Context::userConf(), $token);
+    $as = self::multiplePosts('a');
+    $rs = self::multiplePosts('r');
+    $e_ids = self::multiplePosts('i');
+    self::editTag($e_ids, $as, $rs);
+case 'rename-tag':
+    $token = is_string($_POST['T'] ?? null) ? trim($_POST['T']) : '';
+    self::checkToken(FreshRSS_Context::userConf(), $token);
+case 'disable-tag':
+    $token = is_string($_POST['T'] ?? null) ? trim($_POST['T']) : '';
+    self::checkToken(FreshRSS_Context::userConf(), $token);
+case 'mark-all-as-read':
+    $token = is_string($_POST['T'] ?? null) ? trim($_POST['T']) : '';
+    self::checkToken(FreshRSS_Context::userConf(), $token);
+These are the four API endpoint handlers that invoke checkToken() as CSRF protection. Each one extracts the T parameter from the POST request and passes it to checkToken(). Due to the vulnerability in checkToken(), all these write operations can be performed without a valid CSRF token by sending an empty T parameter.
+POC
+Preconditions: The attacker must have valid Greader API credentials. The target FreshRSS must have API enabled.
+Proof of Concept:
+1. Obtain API auth: POST /api/greader.php/accounts/ClientLogin with Body: Email=target_user&Passwd=api_password
+2. Send write request with empty T: POST /api/greader.php/reader/api/0/edit-tag
+Authorization: GoogleLogin auth=target_user/TOKEN_VALUE
+Body: T=&i=entry_id&a=user/-/state/com.google/read
+3. Expected result: HTTP 200 OK despite empty CSRF token, the entry is marked as read.
+Impact
+An attacker with valid API credentials can mark any entry as read/unread, star/unstar entries, rename/disable categories, and mark entire feeds as read, all without obtaining a proper CSRF token.
+Remediation
+Remove the compatibility bypass logic in checkToken() that accepts empty strings and 'x' as valid tokens. The function should enforce proper token validation for ALL users except the internal '_' user. Delete or comment out lines 253-256 in p/api/greader.php.
+Disclosure Notes
+The code contains a 'TODO: Check security consequences' comment at line 253. Vulnerability identified through static code analysis. Dynamic verification recommended. Affected version: FreshRSS 1.29.1.
+Supplemental Information
+Affected products
+● Ecosystem: self-hosted
+● Package name: FreshRSS/FreshRSS
+● Affected versions: 1.29.1 (likely all versions with Greader API support)
+● Patched versions: to be confirmed
+Severity
+● Scoring method: CVSS v3.1
+● Score: 7.5
+● Vector string: CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:N/I:H/A:N
+Weaknesses
+● CWE: CWE-306: Missing Authentication for Critical Function, CWE-352: Cross-Site Request Forgery (CSRF)
